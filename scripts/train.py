@@ -451,12 +451,13 @@ def main(args: argparse.Namespace):  # noqa: C901
 
         if args.sliding_window_indices and args.speculator_type not in (
             "dflash",
+            "dflare",
             "dspark",
         ):
             raise ValueError(
                 "Currently sliding window attention is only supported by dflash "
-                "and dspark draft models. Please open an issue/pr if you would like "
-                "to use sliding window attention with a different speculator type"
+                "family draft models. Please open an issue/pr if you would like to "
+                "use sliding window attention with a different speculator type"
             )
 
     registry = SpeculatorModel.registry
@@ -659,7 +660,10 @@ def parse_args():
         "--speculator-type",
         type=str,
         default="eagle3",
-        help="Type of speculator model to train (eagle3, dflash, dspark, peagle, mtp)",
+        help=(
+            "Type of speculator model to train "
+            "(eagle3, dflash, dflare, dspark, peagle, mtp)"
+        ),
     )
     parser.add_argument(
         "--from-pretrained",

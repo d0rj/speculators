@@ -182,8 +182,11 @@ def main() -> None:
     generic_train.create_train_val_loaders = create_online_train_val_loaders
 
     args = generic_train.parse_args()
-    if args.speculator_type != "dflash":
-        raise ValueError("Online T5Gemma training only supports dflash")
+    if args.speculator_type not in {"dflash", "dspark", "dflare"}:
+        raise ValueError(
+            "Online T5Gemma training only supports DFlash-family speculators: "
+            "dflash, dspark, dflare"
+        )
     if not hasattr(torch, args.hidden_states_dtype):
         raise ValueError(f"Unknown torch dtype: {args.hidden_states_dtype}")
     args.target_layer_ids = resolve_target_layer_ids(

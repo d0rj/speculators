@@ -192,6 +192,34 @@ Served models can then be benchmarked using [GuideLLM](https://github.com/vllm-p
 
 - [Regenerate responses to enhance your training data](https://github.com/vllm-project/speculators/tree/main/scripts/response_regeneration)
 
+## T5Gemma 2 DFlash-family training examples
+
+This checkout includes local online-training examples for
+`google/t5gemma-2-1b-1b` that avoid offline hidden-state storage by running the
+frozen verifier in-process:
+
+```bash
+bash examples/train/dflash_t5gemma2_1b_1b_online.sh
+bash examples/train/dspark_t5gemma2_1b_1b_online.sh
+bash examples/train/dflare_t5gemma2_1b_1b_online.sh
+```
+
+Common environment overrides:
+
+```bash
+MODEL=google/t5gemma-2-1b-1b \
+DATASET=ultrachat \
+MAX_SAMPLES=5000 \
+OUTPUT_DIR=$HOME/dflash-output/dflare_t5gemma2_online_test \
+T5GEMMA_ONLINE_EXTRACTOR_BATCH_SIZE=8 \
+bash examples/train/dflare_t5gemma2_1b_1b_online.sh
+```
+
+`DSparkDraftModel` reuses the DFlash backbone and adds Markov/confidence heads.
+`DFlareDraftModel` reuses the DFlash training loop but replaces the shared
+target projection with per-layer target-state fusion and separate
+context/noise K/V projections.
+
 ## Getting Started
 
 ### Installation
