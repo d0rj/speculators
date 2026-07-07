@@ -196,7 +196,10 @@ Served models can then be benchmarked using [GuideLLM](https://github.com/vllm-p
 
 This checkout includes local online-training examples for
 `google/t5gemma-2-1b-1b` that avoid offline hidden-state storage by running the
-frozen verifier in-process:
+frozen verifier in-process. By default all three scripts prepare/reuse the same
+deterministic 200k mixture at
+`$HOME/dflash-output/t5gemma2_mixture_200k`, so DFlash, DSpark, and DFlare runs
+are directly comparable.
 
 ```bash
 bash examples/train/dflash_t5gemma2_1b_1b_online.sh
@@ -208,12 +211,29 @@ Common environment overrides:
 
 ```bash
 MODEL=google/t5gemma-2-1b-1b \
-DATASET=ultrachat \
-MAX_SAMPLES=5000 \
+MIXTURE=t5gemma2_200k \
+MAX_SAMPLES=200000 \
+DATA_DIR=$HOME/dflash-output/t5gemma2_mixture_200k \
 OUTPUT_DIR=$HOME/dflash-output/dflare_t5gemma2_online_test \
 T5GEMMA_ONLINE_EXTRACTOR_BATCH_SIZE=8 \
 bash examples/train/dflare_t5gemma2_1b_1b_online.sh
 ```
+
+The default `t5gemma2_200k` mixture is:
+
+| Source | Samples | Purpose |
+| --- | ---: | --- |
+| `ultrachat` | 60k | general instruction/chat |
+| `sharegpt` | 20k | human chat style |
+| `ise-uiuc/Magicoder-Evol-Instruct-110K` | 50k | code generation |
+| `Salesforce/xlam-function-calling-60k` | 40k | function calling / tools |
+| `glaiveai/glaive-function-calling-v2` | 20k | tool-calling conversations |
+| `TIGER-Lab/MathInstruct` | 10k | math/reasoning |
+
+`Salesforce/xlam-function-calling-60k` is gated on Hugging Face; accept its
+terms and make sure your training environment is logged in before preparing the
+mixture. To bypass the built-in mixture and use one custom dataset, run with
+`MIXTURE="" DATASET=/path/to/data.jsonl`.
 
 `DSparkDraftModel` reuses the DFlash backbone and adds Markov/confidence heads.
 `DFlareDraftModel` reuses the DFlash training loop but replaces the shared
