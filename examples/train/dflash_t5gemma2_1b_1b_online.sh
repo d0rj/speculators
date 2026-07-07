@@ -3,7 +3,7 @@ set -euo pipefail
 
 MODEL="${MODEL:-google/t5gemma-2-1b-1b}"
 DATASET="${DATASET:-ultrachat}"
-OUTPUT_DIR="${OUTPUT_DIR:-$HOME/dflash-output/dflash_t5gemma2_online}"
+OUTPUT_DIR="${OUTPUT_DIR:-$HOME/dflash-output/dflash_t5gemma2_online_test}"
 MAX_SAMPLES="${MAX_SAMPLES:-5000}"
 # Use 5 verifier layers, evenly spaced across the decoder, matching the DFlash
 # paper's setup (5 target hidden states between the early and late layers).
