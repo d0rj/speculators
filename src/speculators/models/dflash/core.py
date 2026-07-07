@@ -22,6 +22,17 @@ from speculators.models.metrics import kl_div_loss, resolve_loss_fn
 from speculators.models.utils import conditional_torch_compile, resolve_target_layer_ids
 
 
+class _IdentityNorm(nn.Module):
+    """Identity with a frozen weight placeholder for checkpoint compatibility."""
+
+    def __init__(self, hidden_size: int) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size), requires_grad=False)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return hidden_states
+
+
 @SpeculatorModel.register("dflash")
 class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
     config_class: ClassVar[type[DFlashSpeculatorConfig]] = DFlashSpeculatorConfig  # type: ignore[misc]
@@ -93,10 +104,19 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             config.transformer_layer_config.hidden_size,
             eps=config.transformer_layer_config.rms_norm_eps,  # type: ignore[arg-type]
         )
-        self.verifier_norm = Qwen3RMSNorm(
-            config.transformer_layer_config.hidden_size,
-            eps=config.transformer_layer_config.rms_norm_eps,  # type: ignore[arg-type]
-        )
+        if getattr(
+            config.transformer_layer_config,
+            "verifier_hidden_states_are_normalized",
+            False,
+        ):
+            self.verifier_norm = _IdentityNorm(
+                config.transformer_layer_config.hidden_size
+            )
+        else:
+            self.verifier_norm = Qwen3RMSNorm(
+                config.transformer_layer_config.hidden_size,
+                eps=config.transformer_layer_config.rms_norm_eps,  # type: ignore[arg-type]
+            )
         self.verifier_norm.weight.requires_grad = False
         self.block_size = config.block_size
         self.post_init()
@@ -320,6 +340,13 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             verifier_logits = self.verifier_lm_head(
                 self.verifier_norm(verifier_last_hidden_states)
             )
+            softcap = getattr(
+                self.config.transformer_layer_config,
+                "verifier_final_logit_softcapping",
+                None,
+            )
+            if softcap is not None:
+                verifier_logits = torch.tanh(verifier_logits / softcap) * softcap
             # Shift right by 1 so verifier_logits[i] predicts token at position i
             verifier_logits = torch.roll(verifier_logits, 1, dims=1)
             targets = verifier_logits[:, anchored_block_indices]

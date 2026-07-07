@@ -142,9 +142,17 @@ class DraftVocabMixin(nn.Module):
         if verifier_config.name_or_path is None:
             return
 
-        # Determine which weights to load based on model attributes
-        weights_to_load = ["embed_tokens.weight", "lm_head.weight"]
-        if hasattr(self, "verifier_norm"):
+        # T5Gemma ties its LM head to the shared embedding and the extractor
+        # stores already-normalized decoder states. Avoid requesting absent
+        # decoder-only checkpoint keys in that case.
+        tl_config = self.config.transformer_layer_config
+        hidden_states_are_normalized = getattr(
+            tl_config, "verifier_hidden_states_are_normalized", False
+        )
+        weights_to_load = ["embed_tokens.weight"]
+        if not getattr(tl_config, "verifier_is_encoder_decoder", False):
+            weights_to_load.append("lm_head.weight")
+        if hasattr(self, "verifier_norm") and not hidden_states_are_normalized:
             weights_to_load.append("model.norm.weight")
 
         verifier_weights = load_model_layers(
@@ -177,8 +185,8 @@ class DraftVocabMixin(nn.Module):
             {"weight": lm_head_weight.detach().clone()}, strict=False
         )
 
-        # Load verifier norm weights if the model has verifier_norm
-        if hasattr(self, "verifier_norm"):
+        # Load verifier norm weights when extraction returned pre-norm states.
+        if hasattr(self, "verifier_norm") and not hidden_states_are_normalized:
             if "model.norm.weight" not in verifier_weights:
                 warnings.warn(
                     f"Could not find final norm weights in "

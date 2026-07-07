@@ -56,9 +56,10 @@ def main():
 
     from transformers import AutoConfig  # noqa: PLC0415
 
+    from speculators.models.utils import get_verifier_text_config  # noqa: PLC0415
+
     config = AutoConfig.from_pretrained(args.model)
-    if hasattr(config, "text_config"):
-        config = config.text_config
+    config = get_verifier_text_config(config)
     num_hidden_layers = config.num_hidden_layers
 
     if args.target_layer_ids:

@@ -207,7 +207,7 @@ def run_benchmark(args: argparse.Namespace) -> None:
         if mt is not None:
             all_max_tokens[subset] = mt
 
-    if acceptance_csv is None:
+    if acceptance_csv is None and not args.allow_no_spec:
         logger.error("No acceptance metrics collected from any subset")
         sys.exit(1)
 
@@ -292,6 +292,11 @@ def main() -> None:
         "--data-column-mapper",
         default=DEFAULT_DATA_COLUMN_MAPPER,
         help=f"Column mapping for guidellm (default: {DEFAULT_DATA_COLUMN_MAPPER})",
+    )
+    parser.add_argument(
+        "--allow-no-spec",
+        action="store_true",
+        help="Allow a non-speculative baseline server with no acceptance metrics",
     )
 
     args = parser.parse_args()

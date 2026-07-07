@@ -13,11 +13,23 @@ def conditional_torch_compile(func=None, *args, **kwargs):
     return func
 
 
+def get_verifier_text_config(config: PretrainedConfig) -> PretrainedConfig:
+    """Return the autoregressive text config used by a verifier.
+
+    Decoder-only and multimodal models commonly expose ``text_config``. True
+    encoder-decoder models such as T5Gemma2 instead expose separate ``encoder``
+    and ``decoder`` configs; speculative decoding operates on the decoder.
+    """
+    if getattr(config, "is_encoder_decoder", False) and hasattr(config, "decoder"):
+        return config.decoder
+    if hasattr(config, "text_config"):
+        return config.text_config
+    return config
+
+
 def get_verifier_config(verifier_name_or_path: str) -> PretrainedConfig:
     verifier_config = AutoConfig.from_pretrained(verifier_name_or_path)
-    if hasattr(verifier_config, "text_config"):
-        verifier_config = verifier_config.text_config
-    return verifier_config
+    return get_verifier_text_config(verifier_config)
 
 
 DEFAULT_TARGET_LAYER_IDS_WARNING = (
