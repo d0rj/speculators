@@ -19,9 +19,10 @@ from speculators.train.distributed_batch_sampler import (
 )
 from speculators.train.noise_transforms import AddUniformNoise
 from speculators.train.t5gemma_online import (
-    T5GemmaOnlineDataset,
+    T5GemmaOnlineTokenDataset,
     close_online_extractor,
     configure_online_extractor,
+    _get_online_extractor,
 )
 
 logger = logging.getLogger(__name__)
@@ -47,14 +48,63 @@ def setup_online_dataloader(
         batch_sampler=batch_sampler,
         num_workers=0,
         pin_memory=True,
-        collate_fn=create_collate_fn(
+        collate_fn=create_t5gemma_online_collate_fn(
             generic_train.args.total_seq_len,
             hidden_size,
             num_target_layers=num_target_layers,
             dtype=dataset.hidden_states_dtype,
+            transform=dataset.transform,
             preprocess=preprocess,
         ),
     )
+
+
+def create_t5gemma_online_collate_fn(
+    max_len: int,
+    hidden_size: int,
+    num_target_layers: int = 3,
+    dtype: torch.dtype = torch.bfloat16,
+    transform=None,
+    preprocess=None,
+):
+    """Create a collate function that batches verifier hidden extraction."""
+    base_collate = create_collate_fn(
+        max_len,
+        hidden_size,
+        num_target_layers=num_target_layers,
+        dtype=dtype,
+        preprocess=preprocess,
+    )
+
+    def collate_fn(batch):
+        raw_batch = [sample for sample in batch if sample is not None]
+        if not raw_batch:
+            return base_collate([])
+
+        stacked_batch = _get_online_extractor().extract_stacked_batch(
+            [sample["encoder_input_ids"] for sample in raw_batch],
+            [sample["input_ids"] for sample in raw_batch],
+        )
+
+        processed = []
+        for sample, stacked in zip(raw_batch, stacked_batch, strict=True):
+            input_ids = sample["input_ids"].long()
+            seq_len = input_ids.shape[0]
+            item = {
+                "hidden_states": stacked[:, :-1].flatten(1).to(dtype),
+                "input_ids": input_ids,
+                "verifier_last_hidden_states": stacked[:, -1].to(dtype),
+                "loss_mask": sample["loss_mask"],
+                "lengths": torch.tensor([seq_len], dtype=torch.long),
+                "position_ids": torch.arange(seq_len, dtype=torch.long),
+            }
+            if transform:
+                item = transform(item)
+            processed.append(item)
+
+        return base_collate(processed)
+
+    return collate_fn
 
 
 def create_online_train_val_loaders(
@@ -89,7 +139,7 @@ def create_online_train_val_loaders(
     if not (0.0 < train_data_ratio < 1.0):
         raise ValueError(f"train_data_ratio must be in (0, 1), got {train_data_ratio}")
 
-    train_dataset = T5GemmaOnlineDataset(
+    train_dataset = T5GemmaOnlineTokenDataset(
         datapath=data_path,
         max_len=total_seq_len,
         transform=AddUniformNoise(std=noise_std),
@@ -97,7 +147,7 @@ def create_online_train_val_loaders(
         hidden_states_dtype=hidden_states_dtype,
         model=verifier_name_or_path,
     )
-    val_dataset = T5GemmaOnlineDataset(
+    val_dataset = T5GemmaOnlineTokenDataset(
         datapath=data_path,
         max_len=total_seq_len,
         split_ratio=train_data_ratio - 1.0,

@@ -5,6 +5,10 @@ MODEL="${MODEL:-google/t5gemma-2-1b-1b}"
 DATASET="${DATASET:-ultrachat}"
 OUTPUT_DIR="${OUTPUT_DIR:-$HOME/dflash-output/dflash_t5gemma2_online_test}"
 MAX_SAMPLES="${MAX_SAMPLES:-5000}"
+# Number of samples processed by the frozen verifier in one online extraction
+# microbatch. Increase to 8/16 for higher GPU utilization if VRAM allows;
+# reduce to 1/2 if full-length samples OOM.
+T5GEMMA_ONLINE_EXTRACTOR_BATCH_SIZE="${T5GEMMA_ONLINE_EXTRACTOR_BATCH_SIZE:-4}"
 # Use 5 verifier layers, evenly spaced across the decoder, matching the DFlash
 # paper's setup (5 target hidden states between the early and late layers).
 TARGET_LAYER_IDS=(2 7 13 18 21)
@@ -26,6 +30,7 @@ fi
 # remain zero: worker processes cannot share this in-process CUDA model.
 PYTORCH_ALLOC_CONF=expandable_segments:True \
 TORCHDYNAMO_DISABLE=1 \
+T5GEMMA_ONLINE_EXTRACTOR_BATCH_SIZE="$T5GEMMA_ONLINE_EXTRACTOR_BATCH_SIZE" \
 python scripts/train_t5gemma_online.py \
     --verifier-name-or-path "$MODEL" \
     --data-path "$OUTPUT_DIR" \
