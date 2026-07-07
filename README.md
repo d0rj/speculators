@@ -207,6 +207,17 @@ bash examples/train/dspark_t5gemma2_1b_1b_online.sh
 bash examples/train/dflare_t5gemma2_1b_1b_online.sh
 ```
 
+Each run also writes local TensorBoard events to
+`$HOME/dflash-output/tensorboard/t5gemma2_mixture_200k/<run-name>`, where the
+default run names are `dflash_t5gemma2_mixture_200k`,
+`dspark_t5gemma2_mixture_200k`, and `dflare_t5gemma2_mixture_200k`.
+
+```bash
+tensorboard --logdir "$HOME/dflash-output/tensorboard/t5gemma2_mixture_200k" \
+  --host 0.0.0.0 \
+  --port 6006
+```
+
 Common environment overrides:
 
 ```bash
@@ -215,6 +226,8 @@ MIXTURE=t5gemma2_200k \
 MAX_SAMPLES=200000 \
 DATA_DIR=$HOME/dflash-output/t5gemma2_mixture_200k \
 OUTPUT_DIR=$HOME/dflash-output/dflare_t5gemma2_online_test \
+LOG_DIR=$HOME/dflash-output/tensorboard/t5gemma2_mixture_200k \
+RUN_NAME=dflare_t5gemma2_online_test \
 T5GEMMA_ONLINE_EXTRACTOR_BATCH_SIZE=8 \
 bash examples/train/dflare_t5gemma2_1b_1b_online.sh
 ```

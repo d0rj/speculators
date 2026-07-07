@@ -5,7 +5,9 @@ MODEL="${MODEL:-google/t5gemma-2-1b-1b}"
 MIXTURE="${MIXTURE:-t5gemma2_200k}"
 DATASET="${DATASET:-}"
 DATA_DIR="${DATA_DIR:-$HOME/dflash-output/t5gemma2_mixture_200k}"
-OUTPUT_DIR="${OUTPUT_DIR:-$HOME/dflash-output/dflash_t5gemma2_mixture_200k}"
+OUTPUT_DIR="${OUTPUT_DIR:-../dflash-output/dflash_t5gemma2_mixture_200k}"
+LOG_DIR="${LOG_DIR:-$HOME/dflash-output/tensorboard/t5gemma2_mixture_200k}"
+RUN_NAME="${RUN_NAME:-dflash_t5gemma2_mixture_200k}"
 MAX_SAMPLES="${MAX_SAMPLES:-200000}"
 SEED="${SEED:-42}"
 # Number of samples processed by the frozen verifier in one online extraction
@@ -60,6 +62,9 @@ python scripts/train_t5gemma_online.py \
     --epochs 6 \
     --lr 6e-4 \
     --loss-fn kl_div \
+    --logger tensorboard \
+    --log-dir "$LOG_DIR" \
+    --run-name "$RUN_NAME" \
     --on-missing raise \
     --num-workers 0 \
     --prefetch-factor 1
