@@ -311,11 +311,10 @@ def build_run_specs(args: argparse.Namespace) -> list[RunSpec]:
 
 
 def validate_runtime_args(args: argparse.Namespace) -> None:
-    if not args.enforce_eager and args.max_num_seqs != 1:
-        raise ValueError(
-            "T5Gemma2 CUDA Graph currently requires --max-num-seqs 1. "
-            "Use --enforce-eager for larger scheduler batches."
-        )
+    if args.max_num_seqs <= 0:
+        raise ValueError("--max-num-seqs must be positive")
+    if args.concurrency <= 0:
+        raise ValueError("--concurrency must be positive")
 
 
 def server_command(
@@ -400,18 +399,28 @@ async def run_warmup(
         return
     timeout = httpx.Timeout(args.timeout_s, connect=20.0)
     async with httpx.AsyncClient(timeout=timeout) as client:
-        for index, prompt in enumerate(prompts[: args.warmup]):
-            sample = await one_completion(
-                client,
-                f"{base_url}/v1/completions",
-                served_model_name,
-                prompt,
-                -1 - index,
-                run_name,
-                args,
+        warmup_prompts = prompts[: args.warmup]
+        for start in range(0, len(warmup_prompts), args.concurrency):
+            batch = warmup_prompts[start : start + args.concurrency]
+            samples = await asyncio.gather(
+                *(
+                    one_completion(
+                        client,
+                        f"{base_url}/v1/completions",
+                        served_model_name,
+                        prompt,
+                        -1 - start - offset,
+                        run_name,
+                        args,
+                    )
+                    for offset, prompt in enumerate(batch)
+                )
             )
-            if not sample.ok:
-                raise RuntimeError(f"Warmup failed for {run_name}: {sample.error}")
+            for sample in samples:
+                if not sample.ok:
+                    raise RuntimeError(
+                        f"Warmup failed for {run_name}: {sample.error}"
+                    )
 
 
 def run_result_dir(output_dir: Path, run_name: str, dataset_name: str) -> Path:
