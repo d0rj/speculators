@@ -194,7 +194,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout-s", type=float, default=180.0)
     parser.add_argument("--server-timeout-s", type=float, default=600.0)
     parser.add_argument(
-        "--enforce-eager", action=argparse.BooleanOptionalAction, default=True
+        "--enforce-eager", action=argparse.BooleanOptionalAction, default=False
     )
     parser.add_argument(
         "--include-baseline", action=argparse.BooleanOptionalAction, default=True
@@ -308,6 +308,14 @@ def build_run_specs(args: argparse.Namespace) -> list[RunSpec]:
         checkpoint = models[method]
         runs.extend(RunSpec(f"{method}_k{k}", checkpoint, k) for k in counts)
     return runs
+
+
+def validate_runtime_args(args: argparse.Namespace) -> None:
+    if not args.enforce_eager and args.max_num_seqs != 1:
+        raise ValueError(
+            "T5Gemma2 CUDA Graph currently requires --max-num-seqs 1. "
+            "Use --enforce-eager for larger scheduler batches."
+        )
 
 
 def server_command(
@@ -606,6 +614,7 @@ def write_comparison_markdown(path: Path, rows: list[dict[str, Any]]) -> None:
 
 async def main_async() -> None:
     args = parse_args()
+    validate_runtime_args(args)
     repo_root = Path(__file__).resolve().parents[2]
     output_dir = Path(normalize_path(args.output_dir, base=repo_root)).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
