@@ -236,6 +236,7 @@ def start_server(
     log_path = output_dir / f"{run_name}.server.log"
     env = os.environ.copy()
     env["VLLM_PLUGINS"] = "t5gemma2_vllm_plugin"
+    env.setdefault("VLLM_DISABLE_COMPILE_CACHE", "1")
     env.setdefault("TOKENIZERS_PARALLELISM", "false")
 
     common = [
@@ -394,6 +395,10 @@ async def one_completion(
         "max_tokens": args.max_tokens,
         "temperature": args.temperature,
         "top_p": args.top_p,
+        # Token lists let us account for multiple accepted speculative tokens
+        # delivered in one SSE chunk. Without them, "ITL" measures inter-chunk
+        # latency and systematically penalizes speculative decoding.
+        "logprobs": 0,
         "stream": True,
         "stream_options": {"include_usage": True},
     }
@@ -401,6 +406,7 @@ async def one_completion(
     first_token_at: float | None = None
     chunk_times: list[float] = []
     output_tokens = 0
+    saw_nonempty_text = False
     try:
         async with client.stream("POST", url, json=payload) as resp:
             resp.raise_for_status()
@@ -416,13 +422,25 @@ async def one_completion(
                 if usage and usage.get("completion_tokens") is not None:
                     output_tokens = int(usage["completion_tokens"])
                 choices = obj.get("choices") or []
-                text = choices[0].get("text") if choices else ""
-                if text:
+                choice = choices[0] if choices else {}
+                text = choice.get("text") or ""
+                saw_nonempty_text = saw_nonempty_text or bool(text)
+                logprobs = choice.get("logprobs") or {}
+                tokens = logprobs.get("tokens") or []
+                token_count = len(tokens) if tokens else (1 if text else 0)
+                if token_count:
                     now = time.perf_counter()
                     if first_token_at is None:
                         first_token_at = now
-                    chunk_times.append(now)
+                    # Tokens in one speculative chunk become visible together,
+                    # so their intra-chunk ITLs are correctly represented as 0.
+                    chunk_times.extend([now] * token_count)
         finished = time.perf_counter()
+        if output_tokens > 1 and not saw_nonempty_text:
+            raise RuntimeError(
+                "vLLM reported generated tokens but emitted no text; this usually "
+                "indicates non-finite logits or repeated special tokens"
+            )
         gaps = [
             (b - a) * 1000
             for a, b in zip(chunk_times, chunk_times[1:], strict=False)

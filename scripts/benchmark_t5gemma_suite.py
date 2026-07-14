@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark T5Gemma2 baseline and DFlash-family checkpoints on five suites.
+"""Benchmark T5Gemma2 baseline and DFlash-family checkpoints on six suites.
 
 The script starts one vLLM server per model configuration and runs the same
 saved prompts through every server.  By default it compares the raw verifier
@@ -35,6 +35,7 @@ from benchmark_t5gemma_vllm import (
     write_summary_csv,
 )
 from datasets import load_dataset
+from transformers import AutoTokenizer
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -51,7 +52,8 @@ class DatasetSpec:
     path: str
     config: str | None
     split: str
-    format_row: Callable[[dict[str, Any]], list[str]]
+    format_row: Callable[[dict[str, Any], Any | None], list[str]]
+    requires_tokenizer: bool = False
 
 
 @dataclass(frozen=True)
@@ -61,28 +63,28 @@ class RunSpec:
     num_speculative_tokens: int | None
 
 
-def _math_prompt(row: dict[str, Any]) -> list[str]:
+def _math_prompt(row: dict[str, Any], _tokenizer: Any | None = None) -> list[str]:
     problem = row.get("problem")
     if not isinstance(problem, str) or not problem.strip():
         raise ValueError("MATH-500 row has no non-empty 'problem'")
     return [f"Solve the problem step by step.\n\nProblem: {problem}\nAnswer:"]
 
 
-def _gsm8k_prompt(row: dict[str, Any]) -> list[str]:
+def _gsm8k_prompt(row: dict[str, Any], _tokenizer: Any | None = None) -> list[str]:
     question = row.get("question")
     if not isinstance(question, str) or not question.strip():
         raise ValueError("GSM8K row has no non-empty 'question'")
     return [f"Solve the problem step by step.\n\nQuestion: {question}\nAnswer:"]
 
 
-def _humaneval_prompt(row: dict[str, Any]) -> list[str]:
+def _humaneval_prompt(row: dict[str, Any], _tokenizer: Any | None = None) -> list[str]:
     prompt = row.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip():
         raise ValueError("HumanEval row has no non-empty 'prompt'")
     return [prompt]
 
 
-def _mbpp_prompt(row: dict[str, Any]) -> list[str]:
+def _mbpp_prompt(row: dict[str, Any], _tokenizer: Any | None = None) -> list[str]:
     problem = row.get("text")
     if not isinstance(problem, str) or not problem.strip():
         raise ValueError("MBPP row has no non-empty 'text'")
@@ -92,7 +94,9 @@ def _mbpp_prompt(row: dict[str, Any]) -> list[str]:
     ]
 
 
-def _mt_bench_prompts(row: dict[str, Any]) -> list[str]:
+def _mt_bench_prompts(
+    row: dict[str, Any], _tokenizer: Any | None = None
+) -> list[str]:
     prompts = row.get("prompt")
     if isinstance(prompts, str):
         prompts = [prompts]
@@ -105,6 +109,47 @@ def _mt_bench_prompts(row: dict[str, Any]) -> list[str]:
     if not result:
         raise ValueError("MT-Bench row has no non-empty turns")
     return result
+
+
+def _ultrachat_prompt(row: dict[str, Any], tokenizer: Any | None) -> list[str]:
+    messages = row.get("messages", row.get("conversations"))
+    if not isinstance(messages, (list, tuple)):
+        raise ValueError("UltraChat row has no messages/conversations list")
+
+    normalized = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role", message.get("from", ""))).lower()
+        role = {"human": "user", "gpt": "assistant"}.get(role, role)
+        content = message.get("content", message.get("value", ""))
+        if role in {"system", "user", "assistant"} and str(content).strip():
+            normalized.append({"role": role, "content": str(content)})
+
+    assistant_idx = next(
+        (
+            idx
+            for idx in range(len(normalized) - 1, -1, -1)
+            if normalized[idx]["role"] == "assistant"
+        ),
+        None,
+    )
+    if assistant_idx is None or assistant_idx == 0:
+        raise ValueError("UltraChat row has no assistant answer with a prompt prefix")
+    prefix = normalized[:assistant_idx]
+
+    if tokenizer is not None and tokenizer.chat_template:
+        return [
+            tokenizer.apply_chat_template(
+                prefix,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        ]
+
+    lines = [f"{turn['role'].capitalize()}: {turn['content']}" for turn in prefix]
+    lines.append("Assistant:")
+    return ["\n".join(lines)]
 
 
 DATASETS: dict[str, DatasetSpec] = {
@@ -124,6 +169,14 @@ DATASETS: dict[str, DatasetSpec] = {
         None,
         "train",
         _mt_bench_prompts,
+    ),
+    "ultrachat": DatasetSpec(
+        "ultrachat",
+        "HuggingFaceH4/ultrachat_200k",
+        None,
+        "test_sft",
+        _ultrachat_prompt,
+        requires_tokenizer=True,
     ),
 }
 
@@ -228,8 +281,14 @@ def load_dataset_prompts(
     output_dir: Path,
     num_prompts: int,
     refresh: bool,
+    base_model: str,
+    prompt_token_limit: int,
 ) -> list[str]:
     snapshot = _prompt_snapshot_path(output_dir, spec.name)
+    tokenizer = (
+        AutoTokenizer.from_pretrained(base_model) if spec.requires_tokenizer else None
+    )
+    write_snapshot = False
     if snapshot.exists() and not refresh:
         prompts = [
             json.loads(line)["prompt"]
@@ -237,6 +296,7 @@ def load_dataset_prompts(
             if line.strip()
         ]
     else:
+        write_snapshot = True
         kwargs: dict[str, Any] = {"split": spec.split}
         if spec.config is not None:
             dataset = load_dataset(spec.path, spec.config, **kwargs)
@@ -245,8 +305,32 @@ def load_dataset_prompts(
 
         prompts = []
         for row in dataset:
-            prompts.extend(spec.format_row(dict(row)))
+            prompts.extend(spec.format_row(dict(row), tokenizer))
 
+    if tokenizer is not None:
+        truncated_prompts = []
+        for prompt in prompts:
+            encoded = tokenizer(
+                prompt,
+                add_special_tokens=True,
+                truncation=False,
+            )["input_ids"]
+            if len(encoded) <= prompt_token_limit:
+                truncated_prompts.append(prompt)
+                continue
+            truncated = tokenizer(
+                prompt,
+                add_special_tokens=True,
+                truncation=True,
+                max_length=prompt_token_limit,
+            )["input_ids"]
+            truncated_prompts.append(
+                tokenizer.decode(truncated, skip_special_tokens=True)
+            )
+            write_snapshot = True
+        prompts = truncated_prompts
+
+    if write_snapshot:
         snapshot.parent.mkdir(parents=True, exist_ok=True)
         with snapshot.open("w", encoding="utf-8") as handle:
             for prompt in prompts:
@@ -315,6 +399,8 @@ def validate_runtime_args(args: argparse.Namespace) -> None:
         raise ValueError("--max-num-seqs must be positive")
     if args.concurrency <= 0:
         raise ValueError("--concurrency must be positive")
+    if args.max_tokens <= 0 or args.max_tokens >= args.max_model_len:
+        raise ValueError("--max-tokens must be positive and below --max-model-len")
 
 
 def server_command(
@@ -370,6 +456,9 @@ def start_server(
     cmd = server_command(run, args=args, served_model_name=served_model_name)
     env = os.environ.copy()
     env["VLLM_PLUGINS"] = "t5gemma2_vllm_plugin"
+    # Plugin-side model/proposer patches are outside vLLM's compile-cache hash.
+    # Avoid reusing an AOT artifact produced by an older plugin checkout.
+    env.setdefault("VLLM_DISABLE_COMPILE_CACHE", "1")
     env.setdefault("TOKENIZERS_PARALLELISM", "false")
     env.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
 
@@ -521,6 +610,7 @@ def comparison_rows(
             totals = summary["totals"]
             output_tps = totals["output_throughput_tps"]
             acc = summary.get("speculative_acceptance") or {}
+            acceptance_per_pos = acc.get("acceptance_rate_per_position") or {}
             rows.append(
                 {
                     "dataset": dataset_name,
@@ -560,6 +650,9 @@ def comparison_rows(
                     "tpot_p50_ms": _nested(summary, "tpot_ms", "p50"),
                     "tpot_p95_ms": _nested(summary, "tpot_ms", "p95"),
                     "acceptance_rate": acc.get("acceptance_rate"),
+                    "acceptance_pos_1": acceptance_per_pos.get("0"),
+                    "acceptance_pos_2": acceptance_per_pos.get("1"),
+                    "acceptance_pos_3": acceptance_per_pos.get("2"),
                     "mean_acceptance_length": acc.get(
                         "mean_acceptance_length_including_bonus"
                     ),
@@ -595,6 +688,7 @@ def write_comparison_markdown(path: Path, rows: list[dict[str, Any]]) -> None:
         "ITL mean/p95 ms",
         "TPOT mean/p95 ms",
         "Accept rate",
+        "Accept p1/p2/p3",
         "Accept len",
     ]
     lines = [
@@ -615,6 +709,12 @@ def write_comparison_markdown(path: Path, rows: list[dict[str, Any]]) -> None:
             f"{_fmt(row['itl_mean_ms'])}/{_fmt(row['itl_p95_ms'])}",
             f"{_fmt(row['tpot_mean_ms'])}/{_fmt(row['tpot_p95_ms'])}",
             f"{_fmt(acceptance * 100)}%" if acceptance is not None else "—",
+            "/".join(
+                f"{_fmt(row[f'acceptance_pos_{pos}'] * 100)}%"
+                if row[f"acceptance_pos_{pos}"] is not None
+                else "-"
+                for pos in (1, 2, 3)
+            ),
             _fmt(row["mean_acceptance_length"], 3),
         ]
         lines.append("| " + " | ".join(values) + " |")
@@ -646,6 +746,8 @@ async def main_async() -> None:
             output_dir=output_dir,
             num_prompts=args.num_prompts,
             refresh=args.refresh_prompts,
+            base_model=args.base_model,
+            prompt_token_limit=args.max_model_len - args.max_tokens,
         )
         for name in args.datasets
     }
