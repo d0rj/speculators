@@ -44,6 +44,7 @@ if TYPE_CHECKING:
 DEFAULT_BASE_MODEL = "google/t5gemma-2-1b-1b"
 DEFAULT_OUTPUT_DIR = "benchmark-results/t5gemma2_speculators_suite"
 MAX_SPECULATIVE_TOKENS = 7
+DEFAULT_ULTRACHAT_NUM_PROMPTS = 5_000
 
 
 @dataclass(frozen=True)
@@ -232,6 +233,15 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Prompts per dataset; 0 runs each complete split.",
     )
+    parser.add_argument(
+        "--ultrachat-num-prompts",
+        type=int,
+        default=DEFAULT_ULTRACHAT_NUM_PROMPTS,
+        help=(
+            "Maximum UltraChat prompts (default: 5000); 0 removes the "
+            "UltraChat-specific cap. --num-prompts still applies when smaller."
+        ),
+    )
     parser.add_argument("--warmup", type=int, default=8)
     parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument("--max-num-seqs", type=int, default=1)
@@ -290,11 +300,13 @@ def load_dataset_prompts(
     )
     write_snapshot = False
     if snapshot.exists() and not refresh:
-        prompts = [
-            json.loads(line)["prompt"]
-            for line in snapshot.read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        ]
+        prompts = []
+        with snapshot.open(encoding="utf-8") as handle:
+            for line in handle:
+                if line.strip():
+                    prompts.append(json.loads(line)["prompt"])
+                if num_prompts > 0 and len(prompts) >= num_prompts:
+                    break
     else:
         write_snapshot = True
         kwargs: dict[str, Any] = {"split": spec.split}
@@ -306,6 +318,14 @@ def load_dataset_prompts(
         prompts = []
         for row in dataset:
             prompts.extend(spec.format_row(dict(row), tokenizer))
+            if num_prompts > 0 and len(prompts) >= num_prompts:
+                prompts = prompts[:num_prompts]
+                break
+
+    # Slice cached snapshots before tokenization as they may have been created
+    # by an older run without a per-dataset cap.
+    if num_prompts > 0:
+        prompts = prompts[:num_prompts]
 
     if tokenizer is not None:
         truncated_prompts = []
@@ -336,11 +356,17 @@ def load_dataset_prompts(
             for prompt in prompts:
                 handle.write(json.dumps({"prompt": prompt}, ensure_ascii=False) + "\n")
 
-    if num_prompts > 0:
-        prompts = prompts[:num_prompts]
     if not prompts:
         raise ValueError(f"No prompts loaded for {spec.name}")
     return prompts
+
+
+def dataset_prompt_limit(args: argparse.Namespace, dataset_name: str) -> int:
+    """Return the smallest active global/per-dataset prompt limit."""
+    limits = [args.num_prompts] if args.num_prompts > 0 else []
+    if dataset_name == "ultrachat" and args.ultrachat_num_prompts > 0:
+        limits.append(args.ultrachat_num_prompts)
+    return min(limits) if limits else 0
 
 
 def prompt_hash(prompts: list[str]) -> str:
@@ -395,6 +421,10 @@ def build_run_specs(args: argparse.Namespace) -> list[RunSpec]:
 
 
 def validate_runtime_args(args: argparse.Namespace) -> None:
+    if args.num_prompts < 0:
+        raise ValueError("--num-prompts must be non-negative")
+    if args.ultrachat_num_prompts < 0:
+        raise ValueError("--ultrachat-num-prompts must be non-negative")
     if args.max_num_seqs <= 0:
         raise ValueError("--max-num-seqs must be positive")
     if args.concurrency <= 0:
@@ -744,7 +774,7 @@ async def main_async() -> None:
         name: load_dataset_prompts(
             DATASETS[name],
             output_dir=output_dir,
-            num_prompts=args.num_prompts,
+            num_prompts=dataset_prompt_limit(args, name),
             refresh=args.refresh_prompts,
             base_model=args.base_model,
             prompt_token_limit=args.max_model_len - args.max_tokens,
@@ -825,7 +855,11 @@ async def main_async() -> None:
                 )
                 summaries[(run.name, dataset_name)] = summary
         finally:
-            stop_server(proc)
+            if not stop_server(proc):
+                raise RuntimeError(
+                    f"vLLM process group for {run.name} is still alive after "
+                    "SIGKILL. Restart WSL before resuming the benchmark."
+                )
 
     rows = comparison_rows(summaries, args.datasets, runs)
     write_comparison_csv(output_dir / "comparison.csv", rows)

@@ -290,18 +290,93 @@ def start_server(
     )
 
 
-def stop_server(proc: subprocess.Popen | None) -> None:
-    if proc is None or proc.poll() is not None:
-        return
+def _process_group_has_live_members(pgid: int) -> bool:
+    """Return whether a Linux process group contains a non-zombie process."""
+    proc_root = Path("/proc")
+    if proc_root.is_dir():
+        for stat_path in proc_root.glob("[0-9]*/stat"):
+            try:
+                stat = stat_path.read_text(encoding="utf-8")
+                # The command in /proc/PID/stat is parenthesized and may contain
+                # spaces. Fields after it start with state, ppid, and pgrp.
+                fields = stat[stat.rfind(")") + 2 :].split()
+                if len(fields) >= 3 and int(fields[2]) == pgid:
+                    if fields[0] != "Z":
+                        return True
+            except (FileNotFoundError, PermissionError, ValueError):
+                continue
+        return False
+
     try:
-        os.killpg(proc.pid, signal.SIGTERM)
+        os.killpg(pgid, 0)
     except ProcessLookupError:
-        return
-    try:
-        proc.wait(timeout=30)
-    except subprocess.TimeoutExpired:
-        os.killpg(proc.pid, signal.SIGKILL)
-        proc.wait(timeout=30)
+        return False
+    return True
+
+
+def _wait_for_process_group(
+    proc: subprocess.Popen,
+    pgid: int,
+    timeout_s: float,
+) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        proc.poll()  # Reap the frontend as soon as it exits.
+        if not _process_group_has_live_members(pgid):
+            return True
+        time.sleep(0.2)
+    proc.poll()
+    return not _process_group_has_live_members(pgid)
+
+
+def stop_server(
+    proc: subprocess.Popen | None,
+    *,
+    graceful_timeout_s: float = 30.0,
+    terminate_timeout_s: float = 15.0,
+    kill_timeout_s: float = 15.0,
+) -> bool:
+    """Stop the vLLM frontend and every worker in its process group."""
+    if proc is None:
+        return True
+
+    # start_server uses start_new_session=True, therefore the frontend PID is
+    # also the process-group ID even if the frontend has already exited.
+    pgid = proc.pid
+    if not _process_group_has_live_members(pgid):
+        proc.poll()
+        return True
+
+    # Let the frontend coordinate an orderly EngineCore shutdown first. Sending
+    # SIGTERM to every multiprocessing child at once can wedge CUDA teardown.
+    if proc.poll() is None:
+        try:
+            proc.send_signal(signal.SIGINT)
+        except ProcessLookupError:
+            pass
+    if _wait_for_process_group(proc, pgid, graceful_timeout_s):
+        return True
+
+    for sig, timeout_s in (
+        (signal.SIGTERM, terminate_timeout_s),
+        (signal.SIGKILL, kill_timeout_s),
+    ):
+        try:
+            os.killpg(pgid, sig)
+        except ProcessLookupError:
+            proc.poll()
+            return True
+        if _wait_for_process_group(proc, pgid, timeout_s):
+            return True
+
+    print(
+        f"WARNING: vLLM process group {pgid} did not exit after SIGKILL. "
+        "Do not start the next server until the GPU context is released; "
+        "WSL may need to be restarted.",
+        file=sys.stderr,
+        flush=True,
+    )
+    return False
 
 
 async def fetch_metrics(base_url: str) -> str:
@@ -667,7 +742,11 @@ async def benchmark_one(
         summary = summarize_run(samples, totals, acc)
         return samples, summary
     finally:
-        stop_server(proc)
+        if not stop_server(proc):
+            raise RuntimeError(
+                f"vLLM process group for {run_name} is still alive after "
+                "SIGKILL. Restart WSL before resuming the benchmark."
+            )
 
 
 async def main_async() -> None:
