@@ -17,7 +17,7 @@ The library offers a modular architecture with components for:
 - Standardized interfaces for working with speculative decoding algorithms that
   build on top of Transformers pathways for simple integration.
 - Centralized definition, configuration, and validation of speculative decoding
-  algorithms.
+algorithms.
 """
 
 from .config import (
@@ -29,6 +29,12 @@ from .config import (
 from .model import SpeculatorModel
 from .models import Eagle3DraftModel, Eagle3SpeculatorConfig
 from .proposals import TokenProposalConfig
+from .utils.transformers_compat import patch_gigachat3_deepseek_config
+
+# Transformers 5.12 rejects the otherwise valid GigaChat3 config before any
+# Speculators code can inspect it. Apply the value-preserving compatibility fix
+# as soon as the package is imported by preprocessing, training, or datagen.
+patch_gigachat3_deepseek_config()
 
 __all__ = [
     "Eagle3DraftModel",

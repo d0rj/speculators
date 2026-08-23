@@ -644,7 +644,7 @@ def build_eagle3_dataset(
             num_proc=num_proc,
             batch_size=1000,
             remove_columns=original_cols,
-            keep_in_memory=True,  # skip caching
+            keep_in_memory=False,
         )
 
     dataset.set_format(type="torch")
@@ -744,7 +744,10 @@ def load_raw_dataset(
     if train_data_path in DATASET_CONFIGS:
         config = DATASET_CONFIGS[train_data_path]
         raw_dataset = load_dataset(
-            config.hf_path, name=config.subset, split=config.split
+            config.hf_path,
+            name=config.subset,
+            split=config.split,
+            revision=config.revision,
         )
         if config.filter_fn is not None:
             raw_dataset = raw_dataset.filter(config.filter_fn)
@@ -790,6 +793,7 @@ def load_and_preprocess_dataset(
     *,
     seq_length: int,
     build_dataset_num_proc: int = 8,
+    preprocessing_candidate_multiplier: float = 3.0,
     seed: int = 0,
     max_samples: int | None = None,
     token_freq_path: Path | str = "./token_freq.pt",  # noqa: S107
@@ -825,6 +829,8 @@ def load_and_preprocess_dataset(
     """
     if minimum_valid_tokens is not None and minimum_valid_tokens < 0:
         raise ValueError("minimum_valid_tokens must be >= 0")
+    if preprocessing_candidate_multiplier < 1.0:
+        raise ValueError("preprocessing_candidate_multiplier must be >= 1.0")
     log.section("Starting dataset preprocessing")
     if minimum_valid_tokens is not None:
         log.info(
@@ -846,17 +852,24 @@ def load_and_preprocess_dataset(
         raw_dataset, normalize_fn = load_raw_dataset(train_data_path)
         raw_dataset = raw_dataset.shuffle(seed=seed)
 
-        if max_samples is not None and len(raw_dataset) > 3 * max_samples:
-            # Reduce size to 3 * max_samples to reduce processing
-            # This will then be reduced further to max_samples
-            # after combining datasets and shuffling
-            raw_dataset = raw_dataset.select(range(3 * max_samples))
+        candidate_count = (
+            max(max_samples, int(max_samples * preprocessing_candidate_multiplier))
+            if max_samples is not None
+            else None
+        )
+        if candidate_count is not None and len(raw_dataset) > candidate_count:
+            # Keep a deterministic oversampled pool for filtering. Limiting it
+            # before map avoids materializing the entire source dataset.
+            log.info(
+                f"Limiting {train_data_path} to {candidate_count} candidate samples"
+            )
+            raw_dataset = raw_dataset.select(range(candidate_count))
 
         if normalize_fn is not None:
             raw_dataset = raw_dataset.map(
                 normalize_fn,
                 num_proc=build_dataset_num_proc,
-                keep_in_memory=True,  # skip caching
+                keep_in_memory=False,
             )
 
         log.info(f"Loaded {len(raw_dataset)} samples")

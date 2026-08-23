@@ -305,6 +305,7 @@ def _build_from_config_only(
     t2d: torch.Tensor | None,
     d2t: torch.Tensor | None,
     verifier_name_or_path: str | None = None,
+    draft_attn_impl: str | None = None,
 ) -> SpeculatorModel:
     """Initialize a fresh draft from a saved speculator *config* (no weights).
 
@@ -313,6 +314,11 @@ def _build_from_config_only(
     no trained draft weights to restore (decoder weights are randomly initialized).
     """
     config = model_class.config_class.from_pretrained(path)
+    if draft_attn_impl is not None and hasattr(config, "transformer_layer_config"):
+        # Transformers treats `_attn_implementation` as a runtime-only field and
+        # does not reliably round-trip it through config.json. Restore the CLI
+        # choice so fine-tuning cannot silently fall back to unfused FlexAttention.
+        config.transformer_layer_config._attn_implementation = draft_attn_impl  # noqa: SLF001
     speculators_config = getattr(config, "speculators_config", None)
     # Fall back to the CLI --verifier-name-or-path only when the saved config has
     # no verifier path -- either null or blanked to "". A real path in the config
@@ -365,7 +371,24 @@ def build_draft_model(
                 t2d=t2d,
                 d2t=d2t,
                 verifier_name_or_path=args.verifier_name_or_path,
+                draft_attn_impl=args.draft_attn_impl,
             )
+        config_dict, _ = PretrainedConfig.get_config_dict(args.from_pretrained)
+        if "speculators_model_type" in config_dict:
+            config = model_class.config_class.from_pretrained(args.from_pretrained)
+            if hasattr(config, "transformer_layer_config"):
+                config.transformer_layer_config._attn_implementation = (  # noqa: SLF001
+                    args.draft_attn_impl
+                )
+            return model_class.from_pretrained(
+                args.from_pretrained,
+                config=config,
+                t2d=t2d,
+                d2t=d2t,
+                verifier=args.verifier_name_or_path,
+            )
+        # Preserve the normal external-checkpoint auto-conversion path. Its
+        # converted config is not available until `from_pretrained` runs.
         return model_class.from_pretrained(
             args.from_pretrained,
             t2d=t2d,

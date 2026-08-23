@@ -18,6 +18,7 @@ class DatasetConfig:
     hf_path: str
     subset: str | None = None
     split: str
+    revision: str | None = None
     filter_fn: Callable[[dict], bool] | None = None
     normalize_fn: Callable[[dict], dict] | None = None
 
@@ -26,6 +27,12 @@ def _normalize_ultrachat(example: dict) -> dict:
     if "messages" in example:
         return {"conversations": example["messages"]}
     return example
+
+
+def _normalize_twix(example: dict) -> dict:
+    """Convert T-Wix's OpenAI-style messages into Speculators format."""
+
+    return {"conversations": example["messages"]}
 
 
 def _normalize_gsm8k(example: dict) -> dict:
@@ -112,6 +119,13 @@ DATASET_CONFIGS: dict[str, DatasetConfig] = {
         hf_path="HuggingFaceH4/ultrachat_200k",
         split="train_sft",
         normalize_fn=_normalize_ultrachat,
+    ),
+    "t-wix": DatasetConfig(
+        name="t-wix",
+        hf_path="t-tech/T-Wix",
+        split="train",
+        revision="0059b0967915624069b5b4dc224ebe7ef7c041a6",
+        normalize_fn=_normalize_twix,
     ),
     "gsm8k": DatasetConfig(
         name="gsm8k",

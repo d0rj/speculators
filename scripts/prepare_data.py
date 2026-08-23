@@ -135,6 +135,15 @@ def parse_args():
         help="Number of CPU processes for dataset preprocessing (default: 8)",
     )
     parser.add_argument(
+        "--preprocessing-candidate-multiplier",
+        type=float,
+        default=3.0,
+        help=(
+            "Raw candidates retained per requested output sample before "
+            "filtering (default: 3.0; must be >= 1.0)"
+        ),
+    )
+    parser.add_argument(
         "--minimum-valid-tokens",
         type=int,
         default=None,
@@ -183,6 +192,7 @@ def main():
         train_data_paths=args.data,
         seq_length=args.seq_length,
         build_dataset_num_proc=args.num_preprocessing_workers,
+        preprocessing_candidate_multiplier=args.preprocessing_candidate_multiplier,
         seed=args.seed,
         max_samples=args.max_samples,
         token_freq_path=token_freq_path,
