@@ -14,6 +14,7 @@ import csv
 import hashlib
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -34,7 +35,7 @@ from benchmark_t5gemma_vllm import (
     write_samples_csv,
     write_summary_csv,
 )
-from datasets import load_dataset
+from datasets import load_dataset, load_from_disk
 from transformers import AutoTokenizer
 
 if TYPE_CHECKING:
@@ -45,6 +46,10 @@ DEFAULT_BASE_MODEL = "google/t5gemma-2-1b-1b"
 DEFAULT_OUTPUT_DIR = "benchmark-results/t5gemma2_speculators_suite"
 MAX_SPECULATIVE_TOKENS = 7
 DEFAULT_ULTRACHAT_NUM_PROMPTS = 5_000
+DEFAULT_TWIX_NUM_PROMPTS = 50
+DEFAULT_TWIX_DATA_PATH = (
+    "~/dflash-output/gigachat3_twix_200k_8k_data"
+)
 
 
 @dataclass(frozen=True)
@@ -153,6 +158,13 @@ def _ultrachat_prompt(row: dict[str, Any], tokenizer: Any | None) -> list[str]:
     return ["\n".join(lines)]
 
 
+def _unsupported_twix_formatter(
+    _row: dict[str, Any], _tokenizer: Any | None
+) -> list[str]:
+    """T-Wix held-out prompts are loaded from the prepared Arrow dataset."""
+    raise RuntimeError("twix_heldout uses the prepared-dataset loader")
+
+
 DATASETS: dict[str, DatasetSpec] = {
     "math500": DatasetSpec(
         "math500", "HuggingFaceH4/MATH-500", None, "test", _math_prompt
@@ -177,6 +189,14 @@ DATASETS: dict[str, DatasetSpec] = {
         None,
         "test_sft",
         _ultrachat_prompt,
+        requires_tokenizer=True,
+    ),
+    "twix_heldout": DatasetSpec(
+        "twix_heldout",
+        "prepared:t-tech/T-Wix",
+        None,
+        "validation",
+        _unsupported_twix_formatter,
         requires_tokenizer=True,
     ),
 }
@@ -221,10 +241,23 @@ def parse_args() -> argparse.Namespace:
         default=["dflash", "dflare", "dspark"],
     )
     parser.add_argument(
+        "--named-dspark-model",
+        action="append",
+        default=[],
+        metavar="NAME=PATH",
+        help=(
+            "Benchmark an explicitly named DSpark checkpoint. May be repeated; "
+            "when present, --methods and the three default checkpoint options "
+            "are ignored."
+        ),
+    )
+    parser.add_argument(
         "--datasets",
         nargs="+",
         choices=list(DATASETS),
-        default=list(DATASETS),
+        # twix_heldout requires the local prepared GigaChat training dataset
+        # and is therefore opt-in for the otherwise generic suite.
+        default=[name for name in DATASETS if name != "twix_heldout"],
     )
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
     parser.add_argument(
@@ -242,6 +275,30 @@ def parse_args() -> argparse.Namespace:
             "UltraChat-specific cap. --num-prompts still applies when smaller."
         ),
     )
+    parser.add_argument(
+        "--twix-num-prompts",
+        type=int,
+        default=DEFAULT_TWIX_NUM_PROMPTS,
+        help=(
+            "Maximum prepared T-Wix validation prompts (default: 50); 0 "
+            "removes the T-Wix-specific cap. --num-prompts still applies "
+            "when smaller."
+        ),
+    )
+    parser.add_argument(
+        "--twix-data-path",
+        default=DEFAULT_TWIX_DATA_PATH,
+        help=(
+            "Prepared Arrow dataset used for training. twix_heldout reads "
+            "only its final validation slice."
+        ),
+    )
+    parser.add_argument(
+        "--twix-train-ratio",
+        type=float,
+        default=0.9,
+        help="Training prefix ratio used by the trainer (default: 0.9).",
+    )
     parser.add_argument("--warmup", type=int, default=8)
     parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument("--max-num-seqs", type=int, default=1)
@@ -249,6 +306,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-model-len", type=int, default=2048)
     parser.add_argument("--max-tokens", type=int, default=128)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.85)
+    parser.add_argument(
+        "--linear-backend",
+        default=None,
+        help="Optional vLLM linear kernel backend, for example 'triton'.",
+    )
+    parser.add_argument(
+        "--cudagraph-mode",
+        default=None,
+        choices=["NONE", "PIECEWISE", "FULL", "FULL_AND_PIECEWISE"],
+        help="Override vLLM cudagraph_mode while retaining Inductor compilation.",
+    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8011)
     parser.add_argument("--temperature", type=float, default=0.0)
@@ -258,6 +326,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--server-timeout-s", type=float, default=600.0)
     parser.add_argument(
         "--enforce-eager", action=argparse.BooleanOptionalAction, default=False
+    )
+    parser.add_argument(
+        "--chunked-prefill", action=argparse.BooleanOptionalAction, default=False
+    )
+    parser.add_argument(
+        "--render-user-prompts",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Render non-chat datasets as one-turn user chats with the base tokenizer.",
+    )
+    parser.add_argument("--vllm-plugin", default="t5gemma2_vllm_plugin")
+    parser.add_argument("--served-model-prefix", default="t5gemma2")
+    parser.add_argument(
+        "--disable-compile-cache",
+        action=argparse.BooleanOptionalAction,
+        default=True,
     )
     parser.add_argument(
         "--include-baseline", action=argparse.BooleanOptionalAction, default=True
@@ -293,10 +377,15 @@ def load_dataset_prompts(
     refresh: bool,
     base_model: str,
     prompt_token_limit: int,
+    render_user_prompts: bool = False,
+    twix_data_path: str = DEFAULT_TWIX_DATA_PATH,
+    twix_train_ratio: float = 0.9,
 ) -> list[str]:
     snapshot = _prompt_snapshot_path(output_dir, spec.name)
     tokenizer = (
-        AutoTokenizer.from_pretrained(base_model) if spec.requires_tokenizer else None
+        AutoTokenizer.from_pretrained(base_model)
+        if spec.requires_tokenizer or render_user_prompts
+        else None
     )
     write_snapshot = False
     if snapshot.exists() and not refresh:
@@ -307,6 +396,76 @@ def load_dataset_prompts(
                     prompts.append(json.loads(line)["prompt"])
                 if num_prompts > 0 and len(prompts) >= num_prompts:
                     break
+    elif spec.name == "twix_heldout":
+        write_snapshot = True
+        prepared_path = Path(os.path.expandvars(twix_data_path)).expanduser()
+        if not prepared_path.is_dir():
+            raise FileNotFoundError(
+                f"Prepared T-Wix dataset does not exist: {prepared_path}"
+            )
+        dataset = load_from_disk(str(prepared_path))
+        split_idx = int(len(dataset) * twix_train_ratio)
+        if split_idx <= 0 or split_idx >= len(dataset):
+            raise ValueError(
+                "--twix-train-ratio leaves an empty train or validation split"
+            )
+
+        # This is exactly the negative split_ratio branch in ArrowDataset:
+        # training uses [0, split_idx), validation uses [split_idx, len).
+        prompts = []
+        source_indices = []
+        for source_idx in range(split_idx, len(dataset)):
+            row = dataset[source_idx]
+            input_ids = list(row["input_ids"])
+            loss_mask = [bool(value) for value in row["loss_mask"]]
+            if len(input_ids) != len(loss_mask) or not any(loss_mask):
+                continue
+
+            # Remove the final assistant answer while preserving its generation
+            # marker. The loss mask begins at the first supervised answer token.
+            last_true = max(idx for idx, value in enumerate(loss_mask) if value)
+            answer_start = last_true
+            while answer_start > 0 and loss_mask[answer_start - 1]:
+                answer_start -= 1
+            prompt_ids = input_ids[:answer_start]
+            if not prompt_ids or len(prompt_ids) > prompt_token_limit:
+                continue
+
+            prompt = tokenizer.decode(prompt_ids, skip_special_tokens=False)
+            reencoded = tokenizer(prompt, add_special_tokens=False)["input_ids"]
+            if len(reencoded) > prompt_token_limit:
+                continue
+            prompts.append(prompt)
+            source_indices.append(source_idx)
+            if num_prompts > 0 and len(prompts) >= num_prompts:
+                break
+
+        if num_prompts > 0 and len(prompts) < num_prompts:
+            raise ValueError(
+                f"Only {len(prompts)} T-Wix held-out prompts fit the "
+                f"{prompt_token_limit}-token input limit; requested {num_prompts}"
+            )
+        provenance_path = output_dir / "prompts" / "twix_heldout.provenance.json"
+        provenance_path.parent.mkdir(parents=True, exist_ok=True)
+        provenance_path.write_text(
+            json.dumps(
+                {
+                    "prepared_dataset": str(prepared_path.resolve()),
+                    "prepared_rows": len(dataset),
+                    "train_ratio": twix_train_ratio,
+                    "train_index_range": [0, split_idx],
+                    "heldout_index_range": [split_idx, len(dataset)],
+                    "selected_source_indices": source_indices,
+                    "selection": (
+                        "first held-out rows whose final assistant-prefix fits "
+                        "the benchmark input limit without truncation"
+                    ),
+                    "prompt_token_limit": prompt_token_limit,
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
     else:
         write_snapshot = True
         kwargs: dict[str, Any] = {"split": spec.split}
@@ -321,6 +480,25 @@ def load_dataset_prompts(
             if num_prompts > 0 and len(prompts) >= num_prompts:
                 prompts = prompts[:num_prompts]
                 break
+
+    if (
+        render_user_prompts
+        and spec.name not in {"ultrachat", "twix_heldout"}
+        and write_snapshot
+    ):
+        if tokenizer is None or not tokenizer.chat_template:
+            raise ValueError(
+                f"{base_model} has no chat template required by "
+                "--render-user-prompts"
+            )
+        prompts = [
+            tokenizer.apply_chat_template(
+                [{"role": "user", "content": prompt}],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            for prompt in prompts
+        ]
 
     # Slice cached snapshots before tokenization as they may have been created
     # by an older run without a per-dataset cap.
@@ -366,6 +544,8 @@ def dataset_prompt_limit(args: argparse.Namespace, dataset_name: str) -> int:
     limits = [args.num_prompts] if args.num_prompts > 0 else []
     if dataset_name == "ultrachat" and args.ultrachat_num_prompts > 0:
         limits.append(args.ultrachat_num_prompts)
+    if dataset_name == "twix_heldout" and args.twix_num_prompts > 0:
+        limits.append(args.twix_num_prompts)
     return min(limits) if limits else 0
 
 
@@ -401,11 +581,36 @@ def validate_checkpoint(path_value: str, expected_architecture: str) -> str:
 
 
 def build_run_specs(args: argparse.Namespace) -> list[RunSpec]:
-    models = {
-        "dflash": validate_checkpoint(args.dflash_model, "DFlashDraftModel"),
-        "dflare": validate_checkpoint(args.dflare_model, "DFlareDraftModel"),
-        "dspark": validate_checkpoint(args.dspark_model, "DSparkDraftModel"),
-    }
+    if args.named_dspark_model:
+        named_models: list[tuple[str, str]] = []
+        seen_names: set[str] = set()
+        for value in args.named_dspark_model:
+            if "=" not in value:
+                raise ValueError(
+                    "--named-dspark-model must use NAME=PATH syntax, got "
+                    f"{value!r}"
+                )
+            name, path = value.split("=", 1)
+            if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]*", name):
+                raise ValueError(f"Invalid run name in --named-dspark-model: {name!r}")
+            if name in seen_names:
+                raise ValueError(f"Duplicate named DSpark model: {name}")
+            seen_names.add(name)
+            named_models.append(
+                (name, validate_checkpoint(path, "DSparkDraftModel"))
+            )
+    else:
+        named_models = []
+
+    models = (
+        {}
+        if named_models
+        else {
+            "dflash": validate_checkpoint(args.dflash_model, "DFlashDraftModel"),
+            "dflare": validate_checkpoint(args.dflare_model, "DFlareDraftModel"),
+            "dspark": validate_checkpoint(args.dspark_model, "DSparkDraftModel"),
+        }
+    )
     counts = list(dict.fromkeys(args.speculative_token_counts))
     if any(count <= 0 or count > MAX_SPECULATIVE_TOKENS for count in counts):
         raise ValueError(
@@ -414,9 +619,13 @@ def build_run_specs(args: argparse.Namespace) -> list[RunSpec]:
         )
 
     runs = [RunSpec("baseline", None, None)] if args.include_baseline else []
-    for method in args.methods:
-        checkpoint = models[method]
-        runs.extend(RunSpec(f"{method}_k{k}", checkpoint, k) for k in counts)
+    if named_models:
+        for name, checkpoint in named_models:
+            runs.extend(RunSpec(f"{name}_k{k}", checkpoint, k) for k in counts)
+    else:
+        for method in args.methods:
+            checkpoint = models[method]
+            runs.extend(RunSpec(f"{method}_k{k}", checkpoint, k) for k in counts)
     return runs
 
 
@@ -425,6 +634,10 @@ def validate_runtime_args(args: argparse.Namespace) -> None:
         raise ValueError("--num-prompts must be non-negative")
     if args.ultrachat_num_prompts < 0:
         raise ValueError("--ultrachat-num-prompts must be non-negative")
+    if args.twix_num_prompts < 0:
+        raise ValueError("--twix-num-prompts must be non-negative")
+    if not 0.0 < args.twix_train_ratio < 1.0:
+        raise ValueError("--twix-train-ratio must be between 0 and 1")
     if args.max_num_seqs <= 0:
         raise ValueError("--max-num-seqs must be positive")
     if args.concurrency <= 0:
@@ -454,7 +667,6 @@ def server_command(
         "--gpu-memory-utilization",
         str(args.gpu_memory_utilization),
         "--trust-remote-code",
-        "--no-enable-chunked-prefill",
         "--max-model-len",
         str(args.max_model_len),
         "--max-num-seqs",
@@ -464,6 +676,17 @@ def server_command(
         "--seed",
         str(args.seed),
     ]
+    if not args.chunked_prefill:
+        cmd.append("--no-enable-chunked-prefill")
+    if args.linear_backend:
+        cmd.extend(["--linear-backend", args.linear_backend])
+    if args.cudagraph_mode:
+        cmd.extend(
+            [
+                "--compilation-config",
+                json.dumps({"cudagraph_mode": args.cudagraph_mode}),
+            ]
+        )
     if args.enforce_eager:
         cmd.append("--enforce-eager")
     if run.checkpoint is not None:
@@ -485,10 +708,11 @@ def start_server(
 ) -> subprocess.Popen:
     cmd = server_command(run, args=args, served_model_name=served_model_name)
     env = os.environ.copy()
-    env["VLLM_PLUGINS"] = "t5gemma2_vllm_plugin"
+    env["VLLM_PLUGINS"] = args.vllm_plugin
     # Plugin-side model/proposer patches are outside vLLM's compile-cache hash.
     # Avoid reusing an AOT artifact produced by an older plugin checkout.
-    env.setdefault("VLLM_DISABLE_COMPILE_CACHE", "1")
+    if args.disable_compile_cache:
+        env.setdefault("VLLM_DISABLE_COMPILE_CACHE", "1")
     env.setdefault("TOKENIZERS_PARALLELISM", "false")
     env.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
 
@@ -778,6 +1002,9 @@ async def main_async() -> None:
             refresh=args.refresh_prompts,
             base_model=args.base_model,
             prompt_token_limit=args.max_model_len - args.max_tokens,
+            render_user_prompts=args.render_user_prompts,
+            twix_data_path=args.twix_data_path,
+            twix_train_ratio=args.twix_train_ratio,
         )
         for name in args.datasets
     }
@@ -833,7 +1060,7 @@ async def main_async() -> None:
         if not pending:
             continue
 
-        served_model_name = f"t5gemma2-{run.name}"
+        served_model_name = f"{args.served_model_prefix}-{run.name}"
         proc = start_server(
             run,
             args=args,
